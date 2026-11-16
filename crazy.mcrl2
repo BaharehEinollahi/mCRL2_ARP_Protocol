@@ -1,0 +1,249 @@
+%----------------- BASIC TYPE DEFINITION ----------------------------------------------------------
+sort IP = struct NOIP | IP1 | IP2        | IP3;
+sort MAC = struct BROADMAC | MAC1 | MAC2 | MAC3;
+sort PORT = struct PORT1 | PORT2         | PORT3;
+sort TYPE = struct DATA | REQ_ARP | RES_ARP;
+
+sort Frame = struct FRAME(_srcmac: MAC, _destmac: MAC, _srcip : IP, _destip : IP, _type : TYPE);
+
+
+%----------------- MAC TABLE of SWITCH DEFINITION -------------------------------------------------
+sort MAC_Entry = struct entry(associatedMac: MAC, associatedPort: PORT);
+sort MAC_Table = List(MAC_Entry);
+
+map lookup : MAC # MAC_Table -> Bool;
+    getPort : MAC # MAC_Table -> PORT;
+    update : MAC_Table # MAC # PORT -> MAC_Table;
+    insert_ordered_mac :  MAC_Table # MAC_Entry -> MAC_Table;
+
+
+var m, m1, m2 : MAC;
+    p, p1, p2 : PORT;
+    e : MAC_Entry;
+    mac_table : MAC_Table;
+
+eqn lookup(m, []) = false;
+    lookup(m, entry(m2, p) |> mac_table) =  if(m == m2, true, lookup(m, mac_table));
+        
+    getPort(m, []) = PORT1;
+    getPort(m, entry(m2, p) |> mac_table) = if(m == m2, p, getPort(m, mac_table));
+
+    insert_ordered_mac([], e) = [e];
+    insert_ordered_mac(entry(m1, p1) |> mac_table, entry(m, p)) = 
+        if(m < m1, 
+        entry(m, p) |> (entry(m1, p1) |> mac_table), 
+        entry(m1, p1) |> insert_ordered_mac(mac_table, entry(m, p)));
+
+
+    update([], m, p) = [entry(m, p)];
+
+    update(mac_table, m, p) = 
+        if(lookup(m, mac_table), 
+        mac_table, 
+        insert_ordered_mac(mac_table, entry(m, p)));
+
+
+%----------------- ARP TABLE of HOSTS DEFINITION --------------------------------------------------
+
+map MAX_SIZE: Nat;
+eqn MAX_SIZE = 10;
+
+sort ARP_Entry = struct arpentry(__ip: IP, __mac: MAC);
+sort ARP_TABLE = List(ARP_Entry);
+
+map isFull   : ARP_TABLE -> Bool;
+    lookupIP : ARP_TABLE # IP -> Bool;
+    getMac   : ARP_TABLE # IP -> MAC;
+    insert   : ARP_TABLE # IP # MAC -> ARP_TABLE;
+    insert_ordered_arp : ARP_TABLE # ARP_Entry -> ARP_TABLE;
+    removeIP : ARP_TABLE # IP -> ARP_TABLE;
+
+
+var m, m2 : MAC;
+    i, i1, i2 : IP;
+    arptable : ARP_TABLE;
+    e, e1 : ARP_Entry;
+
+eqn isFull(arptable) = (#arptable == MAX_SIZE);
+
+    lookupIP([], i) = false;
+    lookupIP(arpentry(i2, m) |> arptable, i) =  if(i == i2, true, lookupIP(arptable, i));
+
+    getMac([], i) = MAC1;
+    getMac(arpentry(i2, m) |> arptable, i) = if(i == i2, m, getMac(arptable, i));
+    
+    insert_ordered_arp([], e) = [e];
+    insert_ordered_arp(e1 |> arptable, e) = if(e < e1, 
+                                      e |> (e1 |> arptable), 
+                                      e1 |> insert_ordered_arp(arptable, e));
+    
+    removeIP([], i) = [];
+    removeIP(arpentry(i2, m) |> arptable, i) = 
+        if(i == i2, removeIP(arptable, i), arpentry(i2, m) |> removeIP(arptable, i));
+
+    insert(arptable, i1, m) = 
+        if(#removeIP(arptable, i1) < MAX_SIZE, 
+        insert_ordered_arp(removeIP(arptable, i1), arpentry(i1, m)), 
+        arptable);
+
+%----------------- HELPER -------------------------------------------------------------------------
+map removePort : PORT # List(PORT) -> List(PORT);
+var rest  : List(PORT);
+    p, p2 : PORT;
+eqn removePort(p, []) = [];
+    removePort(p, p2 |> rest) = if(p == p2, removePort(p, rest), p2 |> removePort(p, rest));
+%--------------------------------------------------------------------------------------------------
+act switch_send     : PORT # Frame;
+    switch_recv     : PORT # Frame;
+    host_send       : PORT # Frame;
+    host_recv       : PORT # Frame;
+    switch_to_host  : PORT # Frame;
+    host_to_switch  : PORT # Frame;
+
+
+proc Host(myMAC : MAC, myIP : IP, myPort : PORT, replyMAC : MAC, replyIP : IP, arpTable : ARP_TABLE) =
+
+    (replyIP != NOIP) -> 
+    (
+        host_send(myPort, FRAME(myMAC, replyMAC, myIP, replyIP, RES_ARP))
+        .Host(myMAC, myIP, myPort, MAC1, NOIP, arpTable)
+    )
+    <>
+    (sum destIP : IP. (destIP != NOIP) ->
+        lookupIP(arpTable, destIP) -> 
+            host_send(myPort, FRAME(myMAC, getMac(arpTable, destIP), myIP, destIP, DATA))
+            .Host(myMAC, myIP, myPort, replyMAC, replyIP, arpTable)
+        <>
+            host_send(myPort, FRAME(myMAC, BROADMAC, myIP, destIP, REQ_ARP))
+            .Host(myMAC, myIP, myPort, replyMAC, replyIP, arpTable)
+    )
+    + 
+    (sum srcMAC   : MAC, srcip : IP  
+        .host_recv(myPort, FRAME(srcMAC, myMAC, srcip, myIP, DATA)) 
+        .Host(myMAC, myIP, myPort, replyMAC, replyIP, insert(arpTable, srcip, srcMAC))
+    )
+    +
+    (sum srcMAC   : MAC, srcip : IP  
+        .host_recv(myPort, FRAME(srcMAC, myMAC, srcip, myIP, RES_ARP)) 
+        .Host(myMAC, myIP, myPort, replyMAC, replyIP, insert(arpTable, srcip, srcMAC))
+    )
+    +
+    (sum srcMAC   : MAC, srcip : IP  
+        .host_recv(myPort, FRAME(srcMAC, BROADMAC, srcip, myIP, REQ_ARP)) 
+        .Host(myMAC, myIP, myPort, srcMAC, srcip, insert(arpTable, srcip, srcMAC))
+    )
+    +
+    (sum srcMAC   : MAC, srcip, destip : IP .(destip != myIP)->
+        host_recv(myPort, FRAME(srcMAC, BROADMAC, srcip, destip, REQ_ARP)) 
+        .Host(myMAC, myIP, myPort, replyMAC, replyIP, insert(arpTable, srcip, srcMAC))
+    )
+;
+
+
+proc Crazy(myMAC : MAC, myIP : IP, myPort : PORT,  replyMAC : MAC, replyIP : IP, fakeIP : IP, arpTable : ARP_TABLE) =
+    (replyIP != NOIP) -> 
+    (
+            host_send(myPort, FRAME(myMAC, replyMAC, fakeIP, replyIP, RES_ARP))
+            .Crazy(myMAC, myIP, myPort, replyMAC, replyIP, fakeIP, arpTable)
+    )
+    <>
+    (sum destIP : IP. (destIP != NOIP) ->
+        lookupIP(arpTable, destIP) -> 
+            host_send(myPort, FRAME(myMAC, getMac(arpTable, destIP), fakeIP, destIP, DATA))
+            .Crazy(myMAC, myIP, myPort, replyMAC, replyIP, fakeIP, arpTable)
+        <>
+            host_send(myPort, FRAME(myMAC, BROADMAC, fakeIP, destIP, REQ_ARP))
+            .Crazy(myMAC, myIP, myPort, replyMAC, replyIP, fakeIP, arpTable)
+    )
+    +
+    % recv with my own ip
+    (sum srcMAC : MAC, srcip : IP 
+        .host_recv(myPort, FRAME(srcMAC, myMAC, srcip, myIP, DATA)) 
+        .Crazy(myMAC, myIP, myPort, replyMAC, replyIP, fakeIP, insert(arpTable, srcip, srcMAC))
+    )
+    +
+    (sum srcMAC : MAC, srcip : IP 
+        .host_recv(myPort, FRAME(srcMAC, myMAC, srcip, myIP, RES_ARP)) 
+        .Crazy(myMAC, myIP, myPort, replyMAC, replyIP, fakeIP, insert(arpTable, srcip, srcMAC))
+    )
+    +
+    (sum srcMAC : MAC, srcip : IP 
+        .host_recv(myPort, FRAME(srcMAC, BROADMAC, srcip, myIP, REQ_ARP)) 
+        .Crazy(myMAC, myIP, myPort, srcMAC, srcip, fakeIP, insert(arpTable, srcip, srcMAC))
+    )
+    +
+    % recv with my fake ip
+    (sum srcMAC : MAC, srcip : IP 
+        .host_recv(myPort, FRAME(srcMAC, myMAC, srcip, fakeIP, DATA)) 
+        .Crazy(myMAC, myIP, myPort, replyMAC, replyIP, fakeIP, insert(arpTable, srcip, srcMAC))
+    )
+    +
+    (sum srcMAC : MAC, srcip : IP 
+        .host_recv(myPort, FRAME(srcMAC, myMAC, srcip, fakeIP, RES_ARP)) 
+        .Crazy(myMAC, myIP, myPort, replyMAC, replyIP, fakeIP, insert(arpTable, srcip, srcMAC))
+    )
+    +
+    (sum srcMAC : MAC, srcip : IP 
+        .host_recv(myPort, FRAME(srcMAC, BROADMAC, srcip, fakeIP, REQ_ARP)) 
+        .Crazy(myMAC, myIP, myPort, srcMAC, srcip, fakeIP, insert(arpTable, srcip, srcMAC))
+    )
+    +
+    % recv non self arp req
+    (sum srcMAC : MAC, srcip, destip : IP .(destip != myIP && destip != fakeIP)->
+        host_recv(myPort, FRAME(srcMAC, BROADMAC, srcip, destip, REQ_ARP)) 
+        .Crazy(myMAC, myIP, myPort, replyMAC, replyIP, fakeIP, insert(arpTable, srcip, srcMAC))
+    )
+;
+
+proc BroadCast(frame : Frame, ports : List(PORT)) =
+    sum p : PORT, rest : List(PORT).
+        (ports == p |> rest) ->
+        (
+            (rest == []) -> switch_send(p, frame)<>
+            (rest != []) -> switch_send(p, frame).BroadCast(frame, rest)
+        );
+
+
+proc Switch(allports : List(PORT), table : MAC_Table) =
+    sum srcPort : PORT, srcMAC, destMAC : MAC, srcIP , destIP : IP, type : TYPE
+    .switch_recv(srcPort, FRAME(srcMAC, destMAC, srcIP, destIP, type)) .
+        (destMAC == BROADMAC) ->
+        (
+            BroadCast(FRAME(srcMAC, destMAC, srcIP, destIP, type), removePort(srcPort, allports))
+            .Switch(allports, update(table, srcMAC, srcPort))
+        )
+        <>
+        (
+            lookup(destMAC, update(table, srcMAC, srcPort)) -> 
+                switch_send(getPort(destMAC, update(table, srcMAC, srcPort)), 
+                    FRAME(srcMAC, destMAC, srcIP, destIP, type)) .
+                    Switch(allports, update(table, srcMAC, srcPort))
+            <> 
+            (
+                (removePort(srcPort, allports) == []) -> 
+                    Switch(allports, update(table, srcMAC, srcPort))
+                    <>
+                    BroadCast(FRAME(srcMAC, destMAC, srcIP, destIP, type), removePort(srcPort, allports)).
+                    Switch(allports, update(table, srcMAC, srcPort))
+            )
+        )
+    ;
+
+
+init allow
+    ({switch_to_host, host_to_switch}, 
+        comm(
+            {switch_send | host_recv   -> switch_to_host, 
+                host_send | switch_recv -> host_to_switch
+            }, 
+            % Switch([PORT1, PORT2], []) 
+            Switch([PORT1, PORT2, PORT3], []) 
+            ||  Host(MAC1, IP1, PORT1, MAC1, NOIP, [arpentry(IP1, MAC1)]) 
+            ||  Host(MAC2, IP2, PORT2, MAC1, NOIP, [arpentry(IP2, MAC2)])
+            || Crazy(MAC3, IP3, PORT3, MAC1, NOIP, IP2, [arpentry(IP3, MAC3), arpentry(IP2, MAC3)])
+        )
+    );
+
+
+
+
